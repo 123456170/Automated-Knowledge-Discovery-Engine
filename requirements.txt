@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+networkx
+matplotlib
+pillow
+imageio
+imageio-ffmpeg
