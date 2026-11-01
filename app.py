@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import time
@@ -10,7 +11,10 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib
+
 matplotlib.use("Agg")
+matplotlib.rcParams["figure.max_open_warning"] = 0
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from PIL import Image
@@ -217,6 +221,7 @@ def build_dataset(seed: int):
     for idx, (head, relation, tail, source_doc, span_start, span_end, confidence) in enumerate(OBSERVED_TRIPLES):
         if head not in valid_ids or tail not in valid_ids:
             continue
+
         obs_rows.append(
             {
                 "observed_id": f"obs_{idx:04d}",
@@ -234,11 +239,20 @@ def build_dataset(seed: int):
         )
 
     observed = pd.DataFrame(obs_rows, columns=OBSERVED_COLUMNS)
-    observed["canonical_key"] = observed.apply(lambda row: canonical_key(row["head"], row["tail"]), axis=1)
-    observed_canon = set(observed["canonical_key"])
+
+    if observed.empty:
+        observed["canonical_key"] = pd.Series(dtype="object")
+    else:
+        observed["canonical_key"] = observed.apply(
+            lambda row: canonical_key(row["head"], row["tail"]),
+            axis=1,
+        )
+
+    observed_canon = set(observed["canonical_key"]) if not observed.empty else set()
 
     graph = nx.Graph()
     graph.add_nodes_from(entities["id"])
+
     for row in observed.itertuples(index=False):
         graph.add_edge(row.head, row.tail, relation=row.relation)
 
@@ -327,21 +341,33 @@ def build_dataset(seed: int):
 
     if candidate_rows:
         candidates = pd.DataFrame(candidate_rows, columns=CANDIDATE_COLUMNS)
-        candidates = candidates.sort_values(["score", "candidate_id"], ascending=[False, True]).head(180).reset_index(drop=True)
+        candidates = (
+            candidates.sort_values(["score", "candidate_id"], ascending=[False, True])
+            .head(180)
+            .reset_index(drop=True)
+        )
+        candidates["ingested_at"] = [
+            iso_utc(BASE_TIME + 90000 + i * 17) for i in range(len(candidates))
+        ]
     else:
         candidates = pd.DataFrame(columns=CANDIDATE_COLUMNS)
+        candidates["ingested_at"] = pd.Series(dtype="object")
 
-    candidates["ingested_at"] = [iso_utc(BASE_TIME + 90000 + i * 17) for i in range(len(candidates))]
+    entities_out = entities.drop(columns=["tokens"])
 
-    return entities, observed, candidates, skipped_existing
+    return entities_out, observed, candidates, skipped_existing
 
 
 @st.cache_data(show_spinner=False)
 def compute_simulation(threshold: float, max_new_per_step: int, steps: int, seed: int):
     entities, observed, candidates, skipped_existing = build_dataset(seed)
 
-    active = set(observed["canonical_key"])
-    product_owners = set(observed.loc[observed["relation"] == "produces", "tail"].tolist())
+    active = set(observed["canonical_key"]) if not observed.empty else set()
+    product_owners = (
+        set(observed.loc[observed["relation"] == "produces", "tail"].tolist())
+        if not observed.empty
+        else set()
+    )
 
     discovered_rows = []
     current_step = 1
@@ -386,7 +412,10 @@ def compute_simulation(threshold: float, max_new_per_step: int, steps: int, seed
     )
 
     if not candidates.empty:
-        pending = candidates[~candidates["canonical_key"].isin(active)].head(25).copy()
+        pending_mask = (candidates["score"] >= float(threshold)) & (
+            ~candidates["canonical_key"].isin(active)
+        )
+        pending = candidates[pending_mask].head(25).copy()
     else:
         pending = candidates.copy()
 
@@ -396,7 +425,9 @@ def compute_simulation(threshold: float, max_new_per_step: int, steps: int, seed
         "steps": int(steps),
         "seed": int(seed),
     }
-    config_hash = hashlib.sha256(json.dumps(config_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    config_hash = hashlib.sha256(
+        json.dumps(config_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
 
     avg_confidence = float(discovered["confidence"].mean()) if not discovered.empty else 0.0
 
@@ -486,7 +517,21 @@ def _try_write_gif(path: Path, frames: list, fps: int) -> None:
 
 
 def persist_frames(frames: list, stem: str, fps: int) -> dict:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not frames:
+        return {
+            "path": "",
+            "kind": "error",
+            "message": "No frames were generated.",
+        }
+
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {
+            "path": "",
+            "kind": "error",
+            "message": f"Could not create output directory: {exc}",
+        }
 
     mp4_path = OUTPUT_DIR / f"{stem}.mp4"
     gif_path = OUTPUT_DIR / f"{stem}.gif"
@@ -549,7 +594,7 @@ def generate_video(sim: tuple, steps: int, show_candidates: bool, show_labels: b
     type_map = dict(zip(entities_df["id"], entities_df["type"]))
 
     observed_edges = list(zip(observed_df["head"], observed_df["tail"]))
-    observed_keys = set(observed_df["canonical_key"])
+    observed_keys = set(observed_df["canonical_key"]) if not observed_df.empty else set()
     threshold = float(metrics["threshold"])
 
     base_graph = nx.Graph()
@@ -602,7 +647,9 @@ def generate_video(sim: tuple, steps: int, show_candidates: bool, show_labels: b
         candidate_frontier = []
         if show_candidates and not candidates_df.empty:
             active_keys = observed_keys | set(disc["canonical_key"])
-            mask = (~candidates_df["canonical_key"].isin(active_keys)) & (candidates_df["score"] >= threshold)
+            mask = (~candidates_df["canonical_key"].isin(active_keys)) & (
+                candidates_df["score"] >= threshold
+            )
             frontier_df = candidates_df[mask].head(6)
             candidate_frontier = list(zip(frontier_df["head"], frontier_df["tail"]))
 
@@ -687,7 +734,7 @@ def generate_video(sim: tuple, steps: int, show_candidates: bool, show_labels: b
         fig.tight_layout()
         fig.canvas.draw()
 
-        frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        frame = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[:, :, :3].copy()
 
         plt.close(fig)
         return frame
@@ -705,7 +752,9 @@ def get_video_info(sim: tuple, steps: int, show_candidates: bool, show_labels: b
         "show_candidates": bool(show_candidates),
         "show_labels": bool(show_labels),
     }
-    render_hash = hashlib.sha1(json.dumps(render_payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    render_hash = hashlib.sha1(
+        json.dumps(render_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10]
     key = render_hash
 
     cache = st.session_state.setdefault("video_cache", {})
@@ -730,6 +779,30 @@ def get_video_info(sim: tuple, steps: int, show_candidates: bool, show_labels: b
     return cache[key]
 
 
+def _render_mp4_compat(path: str) -> bool:
+    try:
+        st.video(path, loop=True, muted=True, autoplay=True)
+        return True
+    except TypeError:
+        pass
+    except Exception:
+        return False
+
+    try:
+        st.video(path, loop=True, muted=True)
+        return True
+    except TypeError:
+        pass
+    except Exception:
+        return False
+
+    try:
+        st.video(path)
+        return True
+    except Exception:
+        return False
+
+
 def render_video_widget(video_info: dict) -> None:
     path = video_info.get("path", "")
     kind = video_info.get("kind", "error")
@@ -739,12 +812,14 @@ def render_video_widget(video_info: dict) -> None:
         return
 
     if kind == "mp4":
-        try:
-            st.video(path, loop=True, muted=True, autoplay=True)
-        except TypeError:
-            st.video(path, loop=True, muted=True)
+        rendered = _render_mp4_compat(path)
+        if not rendered:
+            st.warning("MP4 was generated but the browser video widget could not play it. Use the download button below.")
     else:
-        st.image(path, use_container_width=True)
+        try:
+            st.image(path)
+        except Exception as exc:
+            st.error(f"Could not render image artifact: {exc}")
 
     mime_map = {
         "mp4": "video/mp4",
